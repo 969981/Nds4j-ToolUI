@@ -1,0 +1,152 @@
+name: Sync upstream and publish JAR
+
+on:
+  schedule:
+    # Every six hours (GitHub Actions cron runs in UTC).
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/sync-upstream-release.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nds4j-toolui-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect and merge upstream changes
+        id: sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/turtleisaac/Nds4j-ToolUI.git
+          git fetch --no-tags upstream main
+          upstream_sha="$(git rev-parse refs/remotes/upstream/main)"
+          tag="upstream-${upstream_sha:0:12}"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          before="$(git rev-parse HEAD)"
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "Upstream already included in main."
+          else
+            # Preserve our workflow and local commits; never force-push upstream.
+            git merge --no-edit --no-ff "$upstream_sha"
+          fi
+          after="$(git rev-parse HEAD)"
+          echo "commit_sha=$after" >> "$GITHUB_OUTPUT"
+
+          if [[ "$before" != "$after" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
+            echo "release_exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $tag already exists."
+          else
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+            echo "Release $tag does not yet exist."
+          fi
+
+      - name: Set up Java 21
+        if: steps.sync.outputs.changed == 'true' || steps.sync.outputs.release_exists == 'false'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build and test Maven project
+        if: steps.sync.outputs.changed == 'true' || steps.sync.outputs.release_exists == 'false'
+        run: mvn -B -ntp clean verify -Djava.awt.headless=true
+
+      - name: Verify JAR and generate SHA-256
+        if: steps.sync.outputs.changed == 'true' || steps.sync.outputs.release_exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          jars=(target/*.jar)
+          if (( ${#jars[@]} == 0 )); then
+            echo "::error::Maven completed without producing any JAR."
+            exit 1
+          fi
+          for jar in "${jars[@]}"; do
+            jar tf "$jar" | grep -q '\.class$' || {
+              echo "::error::JAR has no compiled classes: $jar"
+              exit 1
+            }
+          done
+          sha256sum "${jars[@]}" > target/SHA256SUMS
+
+      - name: Push tested upstream merge and publish release
+        if: steps.sync.outputs.changed == 'true' || steps.sync.outputs.release_exists == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+          TAG: ${{ steps.sync.outputs.tag }}
+          MERGED_SHA: ${{ steps.sync.outputs.commit_sha }}
+          CHANGED: ${{ steps.sync.outputs.changed }}
+          RELEASE_EXISTS: ${{ steps.sync.outputs.release_exists }}
+        run: |
+          set -euo pipefail
+          if [[ "$CHANGED" == "true" ]]; then
+            auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin HEAD:main
+          fi
+
+          # A previous successful release for the same upstream commit needs
+          # no re-publication, even if an old merge was repaired.
+          if [[ "$RELEASE_EXISTS" == "true" ]]; then
+            echo "No new release required: $TAG"
+            exit 0
+          fi
+
+          cat > release-notes.md <<EOF
+          Automatically synchronized from [turtleisaac/Nds4j-ToolUI](https://github.com/turtleisaac/Nds4j-ToolUI).
+
+          - Upstream revision: [${UPSTREAM_SHA}](https://github.com/turtleisaac/Nds4j-ToolUI/commit/${UPSTREAM_SHA})
+          - This repository revision: \`${MERGED_SHA}\`
+          - Built and tested with Maven on Temurin JDK 21.
+          - Includes compiled library JAR(s) and SHA256SUMS. This is a Java library, not a standalone executable.
+          EOF
+
+          shopt -s nullglob
+          jars=(target/*.jar)
+          gh release create "$TAG" "${jars[@]}" target/SHA256SUMS \
+            --repo "$GH_REPO" \
+            --target "$MERGED_SHA" \
+            --title "Nds4j-ToolUI upstream ${UPSTREAM_SHA:0:12}" \
+            --notes-file release-notes.md
+
+      - name: Upload test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-sync-test-reports
+          path: '**/target/surefire-reports/**'
+          if-no-files-found: ignore
