@@ -51,7 +51,14 @@ jobs:
             echo "Upstream already included in main."
           else
             # Preserve our workflow and local commits; never force-push upstream.
-            git merge --no-edit --no-ff "$upstream_sha"
+            git merge --squash --no-commit "$upstream_sha"
+            while IFS= read -r -d '' added; do
+              git rm -f -- "$added"
+            done < <(git diff --cached --name-only -z --diff-filter=A -- .github/workflows/)
+            git restore --source=HEAD --staged --worktree -- .github/workflows/
+            if ! git diff --cached --quiet; then
+              git commit -m "chore(sync): upstream source $upstream_sha (keep local workflows)"
+            fi
           fi
           after="$(git rev-parse HEAD)"
           echo "commit_sha=$after" >> "$GITHUB_OUTPUT"
